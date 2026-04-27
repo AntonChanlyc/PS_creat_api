@@ -1,41 +1,31 @@
-"""Script to collect user data from GitHub and GitLab APIs and generate a
-summary."""
+"""Flask service that builds a GitHub/GitLab activity resume."""
 
+from datetime import datetime, timezone
 import os
 import sys
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
-import requests
 from dotenv import load_dotenv
+from flask import Flask, jsonify
+import requests
 
 
 class GitHubCollector:
-    """Collects user data from GitHub API."""
+    """Collect data from GitHub REST API."""
 
-    def __init__(self, token: str, base_url: str):
-        """Initialize GitHub collector with token and base URL."""
-        self.token = token
+    def __init__(self, token: str, base_url: str) -> None:
         self.base_url = base_url
         self.session = requests.Session()
-        self.session.headers.update({
-            'Authorization': f'Bearer {token}',
-            'Accept': 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28',
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+        )
 
-    def _make_request(
-        self, url: str, endpoint: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Make a GET request to GitHub API.
-
-        Args:
-            url: Full URL to make request to
-            endpoint: Endpoint name for error messages
-
-        Returns:
-            JSON response as dict or None on error
-        """
+    def _get_json(self, url: str) -> Optional[Any]:
         try:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
@@ -44,304 +34,229 @@ class GitHubCollector:
             return None
 
     def get_profile(self) -> Optional[Dict[str, Any]]:
-        """Get authenticated user profile."""
-        url = f'{self.base_url}/user'
-        return self._make_request(url, '/user')
+        return self._get_json(f"{self.base_url}/user")
 
     def get_repositories(self) -> Optional[List[Dict[str, Any]]]:
-        """Get list of user repositories."""
-        url = f'{self.base_url}/user/repos'
-        return self._make_request(url, '/user/repos')
-
-    def get_languages(
-        self, languages_url: str, repo_name: str
-    ) -> Optional[List[str]]:
-        """
-        Get languages for a repository.
-
-        Args:
-            languages_url: URL to fetch languages
-            repo_name: Repository name for error messages
-
-        Returns:
-            List of language names or None on error
-        """
-        endpoint = f'/repos/{repo_name}/languages'
-        data = self._make_request(languages_url, endpoint)
+        data = self._get_json(f"{self.base_url}/user/repos")
+        if isinstance(data, list):
+            return data
         if data is None:
+            return None
+        return []
+
+    def get_languages(self, languages_url: str) -> Optional[List[str]]:
+        data = self._get_json(languages_url)
+        if not isinstance(data, dict):
             return None
         return list(data.keys())
 
     @staticmethod
-    def count_filled_fields(
-        profile: Optional[Dict[str, Any]]
-    ) -> int:
-        """
-        Count how many of the 4 required fields are filled.
-
-        Fields: login, name, bio, email
-        """
+    def count_filled_fields(profile: Optional[Dict[str, Any]]) -> int:
         if not profile:
             return 0
-
-        fields = ['login', 'name', 'bio', 'email']
-        filled = 0
-        for field in fields:
-            value = profile.get(field)
-            if value is not None and value != '':
-                filled += 1
-        return filled
+        fields = ["login", "name", "bio", "email"]
+        return sum(1 for field in fields if profile.get(field) not in (None, ""))
 
 
 class GitLabCollector:
-    """Collects user data from GitLab API."""
+    """Collect data from GitLab REST API."""
 
-    def __init__(self, token: str, base_url: str):
-        """Initialize GitLab collector with token and base URL."""
-        self.token = token
+    def __init__(self, token: str, base_url: str) -> None:
         self.base_url = base_url
         self.session = requests.Session()
-        self.session.headers.update({
-            'PRIVATE-TOKEN': token,
-        })
+        self.session.headers.update({"PRIVATE-TOKEN": token})
 
-    def _make_request(
-        self, url: str, endpoint: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Make a GET request to GitLab API.
-
-        Args:
-            url: Full URL to make request to
-            endpoint: Endpoint name for error messages
-
-        Returns:
-            JSON response as dict or None on error
-        """
+    def get_profile(self) -> Optional[Dict[str, Any]]:
         try:
-            response = self.session.get(url, timeout=30)
+            response = self.session.get(f"{self.base_url}/user", timeout=30)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            if isinstance(data, dict):
+                return data
+            return None
         except requests.exceptions.RequestException:
             return None
 
-    def get_profile(self) -> Optional[Dict[str, Any]]:
-        """Get authenticated user profile."""
-        url = f'{self.base_url}/user'
-        return self._make_request(url, '/user')
-
     @staticmethod
-    def count_filled_fields(
-        profile: Optional[Dict[str, Any]]
-    ) -> int:
-        """
-        Count how many of the 4 required fields are filled.
-
-        Fields: username, state, location, public_email
-        """
+    def count_filled_fields(profile: Optional[Dict[str, Any]]) -> int:
         if not profile:
             return 0
-
-        fields = ['username', 'state', 'location', 'public_email']
-        filled = 0
-        for field in fields:
-            value = profile.get(field)
-            if value is not None and value != '':
-                filled += 1
-        return filled
+        fields = ["username", "state", "location", "public_email"]
+        return sum(1 for field in fields if profile.get(field) not in (None, ""))
 
 
-def process_github_data(
-    github: GitHubCollector,
-    errors: List[str]
-) -> Dict[str, Any]:
-    """
-    Process GitHub data and return summary.
+def utc_timestamp() -> str:
+    """Return current UTC timestamp in YYYY-MM-DDTHH:MM:SSZ format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    Args:
-        github: GitHubCollector instance
-        errors: List to append errors to
 
-    Returns:
-        Dictionary with GitHub-related summary data
-    """
-    result = {
-        'github_username': None,
-        'total_repos': 0,
-        'total_stars': 0,
-        'total_forks': 0,
-        'most_popular_repo': None,
-        'languages': [],
-        'github_profile_filled': 0,
+def process_github_data(github: GitHubCollector, errors: List[str]) -> Dict[str, Any]:
+    """Collect and aggregate GitHub summary fields."""
+    result: Dict[str, Any] = {
+        "github_username": None,
+        "total_repos": 0,
+        "total_stars": 0,
+        "total_forks": 0,
+        "most_popular_repo": None,
+        "languages": [],
+        "github_profile_filled": 0,
     }
 
-    # Get profile
     profile = github.get_profile()
     if profile:
-        result['github_username'] = profile.get('login')
-        result['github_profile_filled'] = github.count_filled_fields(profile)
+        result["github_username"] = profile.get("login")
+        result["github_profile_filled"] = github.count_filled_fields(profile)
     else:
-        errors.append('github /user: не удалось загрузить профиль')
+        errors.append("github /user: РЅРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ РїСЂРѕС„РёР»СЊ")
 
-    # Get repositories
     repos = github.get_repositories()
     if repos is None:
+        errors.append("github /user/repos: РЅРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ СЂРµРїРѕР·РёС‚РѕСЂРёРё")
         errors.append(
-            'github /user/repos: не удалось загрузить репозитории'
+            "github /repos/languages: РЅРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ СЏР·С‹РєРё РїСЂРѕРµРєС‚Р°"
         )
         return result
 
     if not repos:
         return result
 
-    result['total_repos'] = len(repos)
-
+    result["total_repos"] = len(repos)
     languages_set = set()
-    most_stars = -1
-    most_popular = None
+    max_stars = -1
 
     for repo in repos:
-        name = repo.get('name', '')
-        stars = repo.get('stargazers_count', 0)
-        forks = repo.get('forks_count', 0)
+        stars = repo.get("stargazers_count", 0) or 0
+        forks = repo.get("forks_count", 0) or 0
+        name = repo.get("name")
 
-        result['total_stars'] += stars
-        result['total_forks'] += forks
+        result["total_stars"] += stars
+        result["total_forks"] += forks
 
-        if stars > most_stars:
-            most_stars = stars
-            most_popular = name
+        if stars > max_stars:
+            max_stars = stars
+            result["most_popular_repo"] = name
 
-        languages_url = repo.get('languages_url')
-        if languages_url:
-            repo_languages = github.get_languages(languages_url, name)
-            if repo_languages is not None:
-                languages_set.update(repo_languages)
-            else:
-                errors.append(
-                    f'github /repos/{name}/languages: '
-                    f'не удалось загрузить языки'
-                )
+        languages_url = repo.get("languages_url")
+        if not languages_url:
+            continue
 
-    result['most_popular_repo'] = most_popular
-    result['languages'] = sorted(languages_set)
+        repo_languages = github.get_languages(languages_url)
+        if repo_languages is None:
+            errors.append(
+                "github /repos/languages: РЅРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ СЏР·С‹РєРё РїСЂРѕРµРєС‚Р°"
+            )
+            continue
+        languages_set.update(repo_languages)
 
+    result["languages"] = sorted(languages_set)
     return result
 
 
-def process_gitlab_data(
-    gitlab: GitLabCollector,
-    errors: List[str]
-) -> Dict[str, Any]:
-    """
-    Process GitLab data and return summary.
-
-    Args:
-        gitlab: GitLabCollector instance
-        errors: List to append errors to
-
-    Returns:
-        Dictionary with GitLab-related summary data
-    """
+def process_gitlab_data(gitlab: GitLabCollector, errors: List[str]) -> Dict[str, Any]:
+    """Collect and aggregate GitLab summary fields."""
     result = {
-        'gitlab_username': None,
-        'gitlab_profile_filled': 0,
+        "gitlab_username": None,
+        "gitlab_profile_filled": 0,
     }
 
     profile = gitlab.get_profile()
     if profile:
-        result['gitlab_username'] = profile.get('username')
-        result['gitlab_profile_filled'] = gitlab.count_filled_fields(profile)
+        result["gitlab_username"] = profile.get("username")
+        result["gitlab_profile_filled"] = gitlab.count_filled_fields(profile)
     else:
-        errors.append('gitlab /user: не удалось загрузить профиль')
+        errors.append("gitlab /user: РЅРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ РїСЂРѕС„РёР»СЊ")
 
     return result
 
 
-def load_config() -> Dict[str, str]:
-    """
-    Load configuration from .env file.
-
-    Returns:
-        Dictionary with configuration values
-
-    Raises:
-        SystemExit: If required environment variables are missing
-    """
+def load_config() -> Dict[str, Any]:
+    """Load required environment values from .env and process defaults."""
     load_dotenv()
 
-    github_token = os.getenv('GITHUB_TOKEN')
-    gitlab_token = os.getenv('GITLAB_TOKEN')
-    github_api_url = os.getenv('GITHUB_API_URL')
-    gitlab_api_url = os.getenv('GITLAB_API_URL')
+    github_token = os.getenv("GITHUB_TOKEN")
+    gitlab_token = os.getenv("GITLAB_TOKEN")
+    github_api_url = os.getenv("GITHUB_API_URL")
+    gitlab_api_url = os.getenv("GITLAB_API_URL")
 
     missing = []
     if not github_token:
-        missing.append('GITHUB_TOKEN')
+        missing.append("GITHUB_TOKEN")
     if not gitlab_token:
-        missing.append('GITLAB_TOKEN')
+        missing.append("GITLAB_TOKEN")
     if not github_api_url:
-        missing.append('GITHUB_API_URL')
+        missing.append("GITHUB_API_URL")
     if not gitlab_api_url:
-        missing.append('GITLAB_API_URL')
+        missing.append("GITLAB_API_URL")
 
     if missing:
-        error_msg = (
-            f"Ошибка: отсутствуют переменные окружения: "
-            f"{', '.join(missing)}"
+        print(
+            "РћС€РёР±РєР°: РЅРµ Р·Р°РґР°РЅС‹ РѕР±СЏР·Р°С‚РµР»СЊРЅС‹Рµ РїРµСЂРµРјРµРЅРЅС‹Рµ РѕРєСЂСѓР¶РµРЅРёСЏ: "
+            + ", ".join(missing)
         )
-        print(error_msg)
         sys.exit(1)
 
     return {
-        'github_token': github_token,
-        'gitlab_token': gitlab_token,
-        'github_api_url': github_api_url.rstrip('/'),
-        'gitlab_api_url': gitlab_api_url.rstrip('/'),
+        "github_token": github_token,
+        "gitlab_token": gitlab_token,
+        "github_api_url": github_api_url.rstrip("/"),
+        "gitlab_api_url": gitlab_api_url.rstrip("/"),
+        "host": os.getenv("HOST", "0.0.0.0"),
+        "port": int(os.getenv("PORT", "8080")),
     }
+
+
+def build_resume(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build complete resume response object."""
+    errors: List[str] = []
+
+    github = GitHubCollector(config["github_token"], config["github_api_url"])
+    gitlab = GitLabCollector(config["gitlab_token"], config["gitlab_api_url"])
+
+    github_data = process_github_data(github, errors)
+    gitlab_data = process_gitlab_data(gitlab, errors)
+
+    return {
+        "metadata": {"last_updated": utc_timestamp()},
+        "github_username": github_data["github_username"],
+        "gitlab_username": gitlab_data["gitlab_username"],
+        "total_repos": github_data["total_repos"],
+        "total_stars": github_data["total_stars"],
+        "total_forks": github_data["total_forks"],
+        "most_popular_repo": github_data["most_popular_repo"],
+        "languages": github_data["languages"],
+        "github_profile_filled": github_data["github_profile_filled"],
+        "gitlab_profile_filled": gitlab_data["gitlab_profile_filled"],
+        "errors": errors,
+    }
+
+
+def create_app(config: Dict[str, Any]) -> Flask:
+    """Create Flask application with cached resume state."""
+    app = Flask(__name__)
+    state: Dict[str, Any] = {"resume": build_resume(config)}
+    lock = Lock()
+
+    @app.get("/api/resume")
+    def get_resume() -> Any:
+        with lock:
+            return jsonify(state["resume"])
+
+    @app.post("/api/resume/update")
+    def update_resume() -> Any:
+        new_resume = build_resume(config)
+        with lock:
+            state["resume"] = new_resume
+            return jsonify(state["resume"])
+
+    return app
 
 
 def main() -> None:
-    """Main function to collect data and generate result.json."""
+    """Entrypoint: load env, prefetch data, run HTTP server."""
     config = load_config()
-
-    errors: List[str] = []
-
-    # Collect GitHub data
-    github = GitHubCollector(
-        token=config['github_token'],
-        base_url=config['github_api_url']
-    )
-    github_data = process_github_data(github, errors)
-
-    # Collect GitLab data
-    gitlab = GitLabCollector(
-        token=config['gitlab_token'],
-        base_url=config['gitlab_api_url']
-    )
-    gitlab_data = process_gitlab_data(gitlab, errors)
-
-    # Combine results
-    result = {
-        'github_username': github_data['github_username'],
-        'gitlab_username': gitlab_data['gitlab_username'],
-        'total_repos': github_data['total_repos'],
-        'total_stars': github_data['total_stars'],
-        'total_forks': github_data['total_forks'],
-        'most_popular_repo': github_data['most_popular_repo'],
-        'languages': github_data['languages'],
-        'github_profile_filled': github_data['github_profile_filled'],
-        'gitlab_profile_filled': gitlab_data['gitlab_profile_filled'],
-        'errors': errors,
-    }
-
-    # Write to file
-    import json
-    with open('result.json', 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    print("Данные успешно сохранены в result.json")
+    app = create_app(config)
+    app.run(host=config["host"], port=config["port"])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
